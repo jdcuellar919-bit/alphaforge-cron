@@ -1,0 +1,71 @@
+name: Refresh market cache
+
+# Runs AlphaForge's shared-cache refresh jobs from a PUBLIC repo so GitHub
+# Actions minutes are unlimited. The main repo went private on 2026-09-06
+# (employer compliance), which put these ~2,700 min/month of crons over the
+# 2,000-minute private-repo quota — when that runs out, every workflow stops.
+# The code is NOT duplicated: this checks out the private repo read-only.
+#
+# Required repo secrets (Settings → Secrets and variables → Actions):
+#   MAIN_REPO_TOKEN       fine-grained PAT scoped to jdcuellar919-bit/alphaforgeresearch,
+#                         permission "Contents: Read-only" (nothing else)
+#   POLYGON_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_KEY   (same values as the main repo)
+#
+# Schedules mirror backend/refresh_cache.py's sections (see the main repo's
+# .github/workflows/refresh-cache.yml history). Once a manual run succeeds here,
+# remove the `schedule:` triggers from the main repo so nothing double-runs.
+
+on:
+  schedule:
+    - cron: '5 13-21 * * 1-5'   # movers + growth: hourly during US market hours (UTC, Mon–Fri)
+    - cron: '15 12 * * 1-5'      # calendar + Daily Brief: pre-market (UTC, Mon–Fri)
+    - cron: '0 9 * * *'         # fundamentals pack: daily at a dead hour (~40 min)
+    - cron: '30 21 * * 2-6'     # Prime whole-market scan: first reliable EOD window (~35 min)
+  workflow_dispatch:
+    inputs:
+      sections:
+        description: 'Sections to refresh (e.g. "movers growth", "fundamentals", empty = movers growth)'
+        required: false
+        default: 'movers growth'
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: jdcuellar919-bit/alphaforgeresearch
+          token: ${{ secrets.MAIN_REPO_TOKEN }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install yfinance (calendar fallback source)
+        run: pip install -q yfinance
+      - name: Pick sections
+        id: pick
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "args=${{ github.event.inputs.sections || 'movers growth' }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "15 12 * * 1-5" ]; then
+            echo "args=calendar" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "0 9 * * *" ]; then
+            echo "args=calendar nextearn bthistory fundamentals smartmoney" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "30 21 * * 2-6" ]; then
+            echo "args=swingmarket" >> "$GITHUB_OUTPUT"
+          else
+            echo "args=movers growth" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Refresh cache
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python backend/refresh_cache.py ${{ steps.pick.outputs.args }}
+      - name: Generate the shared Daily Brief before the open
+        if: github.event.schedule == '15 12 * * 1-5'
+        run: |
+          curl --fail --silent --show-error --retry 4 --retry-all-errors --max-time 180 \
+            -H 'User-Agent: AlphaForge-Cron/1.0' \
+            https://alphaforgeresearch.onrender.com/brief > /tmp/daily-brief.json
+          python -c "import json; d=json.load(open('/tmp/daily-brief.json')); assert d.get('text') and d.get('date')"
